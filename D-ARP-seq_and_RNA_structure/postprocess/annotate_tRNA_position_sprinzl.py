@@ -1,249 +1,57 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-脚本名称: annotate_tRNA_position_sprinzl.py
-功能: 为 chr/position 位点表添加 Sprinzl 编号注释 (tRNA 标准位点命名)
+Script: annotate_tRNA_position_sprinzl.py
+Purpose: Add Sprinzl numbering (standard tRNA site names) to chr/position tables
 ================================================================================
 
-背景/用途:
-  本脚本用于将 tRNA 突变/修饰检测流水线中的原始坐标 (tRNAscan-SE ID +
-  raw position)，映射为 Sprinzl 标准编号体系，便于跨研究比较和文献对照。
+Background:
+  Map raw coordinates from a tRNA mutation/modification pipeline
+  (tRNAscan-SE ID + raw position) onto Sprinzl numbering so sites can be
+  compared across studies and with the literature.
 
-  典型输入来源:
-    - tRNA 突变检测输出的 TSV 文件 (含 chr/trnascan_id 和 position/raw_pos 列)
-    - 需要 Sprinzl 注释的位点汇总表
+  Typical inputs:
+    - TSV tables from tRNA mutation calling (chr/trnascan_id and position/raw_pos)
+    - Site summaries that need Sprinzl annotation
 
-  输出用于下游分析:
-    - 在 position 列后插入 sprinzl_position 列
-    - 统计注释成功/未匹配位点数
-    - 未匹配位点保留原始 position 值作为回退
+  Outputs:
+    - Insert sprinzl_position after the position column
+    - Count annotated vs unmatched rows
+    - Unmatched sites keep the original position as a fallback
 
-  Sprinzl 编号体系:
-    tRNA 学界通用的位点编号标准，以反密码子环为基准 (位置 34/35/36)，
-    便于不同 tRNA 之间的位点对应与比较。
+  Sprinzl numbering:
+    Community-standard tRNA site numbers, anchored on the anticodon loop
+    (positions 34/35/36), so homologous sites can be compared across tRNAs.
 
-================================================================================
+Workflow:
+  parse args (in-place and --output are mutually exclusive)
+    -> load_mapping() from hg38_trna_raw_to_sprinzl.tsv
+    -> resolve_jobs() (single file, directory, or --in-place)
+    -> annotate_file() / write_annotated_file() (optional ProcessPool)
+    -> write {stem}.sprinzl.tsv, sprinzl_annotated/, or overwrite in place
 
-工作流程 (按执行顺序):
+Mapping lookup in write_annotated_file():
+  1. Locate chr/position columns (names are configurable)
+  2. Drop an existing output_col to avoid duplicate inserts
+  3. Insert sprinzl_position after position
+  4. key = (normalize_id(chr), normalize_position(position))
+  5. Hit -> write sprinzl_pos; miss -> keep the raw position
 
-    ┌─────────────────────────────────────┐
-    │  输入: -i 位点文件或目录            │
-    │  映射表: hg38_trna_raw_to_sprinzl.tsv│
-    └──────────────┬──────────────────────┘
-                   │
-                   ↓
-    ┌─────────────────────────────────────┐
-    │  main() / parse_args()              │
-    │  ───────────────────────────────   │
-    │  • 解析命令行参数                   │
-    │  • 验证 in-place / output 互斥      │
-    └──────────────┬──────────────────────┘
-                   │
-                   ↓
-    ┌─────────────────────────────────────┐
-    │  load_mapping()                     │
-    │  加载 Sprinzl 映射表                │
-    │  ───────────────────────────────   │
-    │  • 读取 (trnascan_id, raw_pos) 键   │
-    │  • 构建 → sprinzl_pos 字典          │
-    │  • 校验重复键一致性                 │
-    └──────────────┬──────────────────────┘
-                   │
-                   ↓
-    ┌─────────────────────────────────────┐
-    │  resolve_jobs()                     │
-    │  确定输入/输出文件对                │
-    │  ───────────────────────────────   │
-    │  • 单文件 → 单 job                  │
-    │  • 目录 → collect_input_files()     │
-    │  • 支持 --in-place 原地覆盖         │
-    └──────────────┬──────────────────────┘
-                   │
-                   ↓
-    ┌─────────────────────────────────────┐
-    │  annotate_file() × N                │
-    │  [逐文件注释，可 ProcessPool 并行]  │
-    │  ───────────────────────────────   │
-    │  │  ┌────────────────────────────┐  │
-    │  └→ │ write_annotated_file()    │  │
-    │     │ [核心算法]                │  │
-    │     │ • 读取表头，定位列索引    │  │
-    │     │ • 在 position 后插入新列  │  │
-    │     │ • 查映射表获取 Sprinzl 号 │  │
-    │     │ • 未匹配则保留原 position │  │
-    │     └───────────┬────────────────┘  │
-    └─────────────────┼───────────────────┘
-                      │
-                      ↓
-    ┌─────────────────────────────────────┐
-    │  输出注释文件                        │
-    │  ───────────────────────────────   │
-    │  单文件: {stem}.sprinzl.tsv         │
-    │  目录:   sprinzl_annotated/         │
-    │  原地:   --in-place 覆盖原文件      │
-    └─────────────────────────────────────┘
+In-place writes:
+  write .{name}.sprinzl.tmp.{pid}, then os.replace() onto the original file
 
-================================================================================
-核心函数说明 (按执行顺序):
+CLI (summary):
+  -i/--input, -o/--output, --in-place, --suffix
+  --map-file, --map-id-col, --map-position-col, --map-sprinzl-col
+  --chr-col, --position-col, --output-col, --sep, --map-sep
+  --pattern, --recursive, --workers, --continue-on-error
 
-  主流程函数:
-  1. main()                   - 主入口，加载映射表并分发任务
-  2. parse_args()             - 解析命令行参数
-  3. load_mapping()           - 加载 Sprinzl 映射表为字典
-  4. resolve_jobs()           - 解析单文件/目录模式的输入输出对
-
-  文件发现:
-  5. collect_input_files()    - 目录模式按 glob pattern 收集文件
-  6. insert_suffix()          - 生成带 .sprinzl 后缀的输出文件名
-
-  注释核心:
-  7. annotate_file()          - 单文件注释 (含 in-place 临时文件安全写入)
-     └→ write_annotated_file() - [核心] 逐行查表并插入 sprinzl_position 列
-
-  并行:
-  8. _init_worker()           - ProcessPool worker 初始化 (共享映射表)
-  9. _worker_annotate()       - 进程池 worker 封装
-
-  辅助函数:
-  - normalize_id()            - 标准化 ID/chr 值 (strip)
-  - normalize_position()      - 标准化 position 值 (整数化)
-  - open_text()               - 自动处理 .gz 压缩文件
-
-================================================================================
-核心算法说明 - write_annotated_file():
-
-  映射查找逻辑:
-  ─────────────────────────────────────────────────────────────────────
-  步骤    操作                              说明
-  ─────────────────────────────────────────────────────────────────────
-  1       读取表头，定位 chr/position 列    列名可通过 --chr-col 等指定
-  2       移除已有的 output_col 列          避免重复插入
-  3       在 position 列后插入新列          sprinzl_position
-  4       key = (normalize_id(chr),         标准化后查映射字典
-             normalize_position(position))
-  5       命中 → 写入 sprinzl_pos           annotated_rows += 1
-  6       未命中 → 保留原 position 值       作为回退，不计入 annotated
-  ─────────────────────────────────────────────────────────────────────
-
-  映射表结构 (默认 hg38_trna_raw_to_sprinzl.tsv):
-    - trnascan_id:  与输入 chr 列对应 (tRNAscan-SE ID)
-    - raw_pos:      与输入 position 列对应 (原始坐标)
-    - sprinzl_pos:  Sprinzl 标准编号 (输出值)
-
-  in-place 安全写入:
-    - 先写入临时文件 .{name}.sprinzl.tmp.{pid}
-    - 成功后 os.replace() 原子替换原文件
-
-================================================================================
-输入格式:
-
-  位点文件:
-    - 带表头的 TSV/CSV (默认 tab 分隔)
-    - 必需列: chr (或 --chr-col 指定) 和 position (或 --position-col 指定)
-    - 支持 .gz 压缩
-    - 单文件或目录批量 (*.tsv 默认)
-
-  Sprinzl 映射表 (--map-file):
-    - 默认: 脚本同目录下 hg38_trna_raw_to_sprinzl.tsv
-    - 列: trnascan_id, raw_pos, sprinzl_pos (列名可自定义)
-    - 键 (trnascan_id, raw_pos) 必须唯一且一致
-
-================================================================================
-输出格式:
-
-  注释结果 (原文件 + sprinzl_position 列):
-  ─────────────────────────────────────────────────────────────────────
-  列名              说明
-  ─────────────────────────────────────────────────────────────────────
-  (原始列...)       输入文件所有原始列保留
-  sprinzl_position  插入在 position 列之后
-                    命中映射表 → Sprinzl 编号
-                    未命中     → 保留原始 position 值
-  ─────────────────────────────────────────────────────────────────────
-
-  终端统计 (每文件):
-    rows=总数据行数, annotated=成功映射行数, unannotated=未匹配行数
-
-  输出路径规则:
-    - 单文件无 -o: {stem}.sprinzl.tsv
-    - 目录无 -o:   {input_dir}/sprinzl_annotated/
-    - --in-place:   覆盖原文件
-
-================================================================================
-命令行参数:
-
-  输入输出:
-    -i, --input             输入文件或文件夹 (必需)
-    -o, --output            输出文件或文件夹
-    --in-place              原地覆盖 (不可与 -o 同用)
-    --suffix                输出文件名后缀 (默认: .sprinzl)
-
-  Sprinzl 映射表:
-    --map-file              映射表路径
-    --map-id-col            映射表 ID 列 (默认: trnascan_id)
-    --map-position-col      映射表 position 列 (默认: raw_pos)
-    --map-sprinzl-col       映射表 Sprinzl 列 (默认: sprinzl_pos)
-
-  输入列名:
-    --chr-col               输入 ID/chr 列 (默认: chr)
-    --position-col          输入 position 列 (默认: position)
-    --output-col            输出列名 (默认: sprinzl_position)
-
-  文件格式:
-    --sep                   输入/输出分隔符 (默认: tab)
-    --map-sep               映射表分隔符 (默认: tab)
-
-  批量模式:
-    --pattern               glob 模式 (默认: *.tsv, 可重复)
-    --recursive             递归搜索
-    --workers               并行进程数 (默认: 1)
-    --continue-on-error     单文件失败时继续处理
-
-================================================================================
-使用示例:
-
-  1. 注释单个 TSV 文件:
-      python /home/pf/14T/scripts/annotate_tRNA_position_sprinzl.py \\
-         -i sample.tsv \\
-         -o sample.sprinzl.tsv
-
-  2. 目录批量 + 8 并行:
-      python /home/pf/14T/scripts/annotate_tRNA_position_sprinzl.py \\
-         -i input_dir \\
-         -o output_dir \\
-         --workers 8
-
-  3. 自定义列名映射:
-      python /home/pf/14T/scripts/annotate_tRNA_position_sprinzl.py \\
-         -i sample.tsv \\
-         --chr-col trnascan_id \\
-         --position-col raw_pos
-
-  4. 原地覆盖 + 递归搜索:
-      python /home/pf/14T/scripts/annotate_tRNA_position_sprinzl.py \\
-         -i mutation_results/ \\
-         --in-place --recursive --pattern '*.tsv'
-
-  5. 完整参数示例:
-      python /home/pf/14T/scripts/annotate_tRNA_position_sprinzl.py \\
-         -i /data/tRNA_mutations \\
-         -o /data/tRNA_sprinzl \\
-         --map-file /ref/hg38_trna_raw_to_sprinzl.tsv \\
-         --chr-col chr --position-col position \\
-         --workers 4 --continue-on-error
-
-================================================================================
-依赖:
-  - Python 3.10+ (使用 type hints 与 union 语法)
-  - 标准库: argparse, csv, gzip, re, concurrent.futures, pathlib
-
-================================================================================
-注意事项:
-  1. 映射表键 (trnascan_id, raw_pos) 必须与输入文件的 chr/position 精确匹配
-  2. 未匹配位点不会报错，而是保留原始 position 值 (unannotated 计数增加)
-  3. --in-place 使用临时文件 + 原子替换，避免写入中断损坏原文件
-  4. 目录模式默认排除映射表自身，避免误处理
-  5. 映射表中同一键对应不同 Sprinzl 值时会报错终止
+Notes:
+  1. Mapping keys must match input chr/position exactly
+  2. Unmatched sites are not errors; they keep the raw position
+  3. --in-place uses a temp file plus atomic replace
+  4. Directory mode skips the mapping file itself
+  5. Conflicting Sprinzl values for the same key abort the run
 
 ================================================================================
 """
@@ -270,119 +78,120 @@ _WORKER_CONFIG = None
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="给含 chr 和 position 列的文件添加 Sprinzl position 注释。",
+        description="Add Sprinzl position annotation to tables with chr and position columns.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    input_group = parser.add_argument_group("输入输出")
+    input_group = parser.add_argument_group("Input / output")
     input_group.add_argument(
         "-i",
         "--input",
         required=True,
-        help="输入文件或输入文件夹。",
+        help="Input file or directory.",
     )
     input_group.add_argument(
         "-o",
         "--output",
         default=None,
         help=(
-            "输出文件或输出文件夹。单文件输入时可省略，默认在原文件名中插入后缀；"
-            "文件夹输入时可省略，默认写入输入文件夹下的 sprinzl_annotated/。"
+            "Output file or directory. Optional for a single input file "
+            "(a suffix is inserted into the original name); optional for a "
+            "directory (defaults to sprinzl_annotated/ under the input directory)."
         ),
     )
     input_group.add_argument(
         "--in-place",
         action="store_true",
-        help="原地覆盖输入文件。启用后不能同时指定 --output。",
+        help="Overwrite input files in place. Cannot be combined with --output.",
     )
     input_group.add_argument(
         "--suffix",
         default=".sprinzl",
-        help="未原地覆盖时，插入到输出文件名中的后缀（默认: .sprinzl）。",
+        help="Suffix inserted into output names when not overwriting in place (default: .sprinzl).",
     )
 
-    map_group = parser.add_argument_group("Sprinzl 映射表")
+    map_group = parser.add_argument_group("Sprinzl mapping table")
     map_group.add_argument(
         "--map-file",
         default=str(DEFAULT_MAP_FILE),
-        help=f"Sprinzl 映射表路径（默认: {DEFAULT_MAP_FILE}）。",
+        help=f"Path to the Sprinzl mapping table (default: {DEFAULT_MAP_FILE}).",
     )
     map_group.add_argument(
         "--map-id-col",
         default="trnascan_id",
-        help="映射表中与输入 chr 列对应的列名（默认: trnascan_id）。",
+        help="Mapping-table column matching the input chr column (default: trnascan_id).",
     )
     map_group.add_argument(
         "--map-position-col",
         default="raw_pos",
-        help="映射表中与输入 position 列对应的列名（默认: raw_pos）。",
+        help="Mapping-table column matching the input position column (default: raw_pos).",
     )
     map_group.add_argument(
         "--map-sprinzl-col",
         default="sprinzl_pos",
-        help="映射表中要写入输出的 Sprinzl 列名（默认: sprinzl_pos）。",
+        help="Mapping-table column written to the output (default: sprinzl_pos).",
     )
 
-    column_group = parser.add_argument_group("输入列名")
+    column_group = parser.add_argument_group("Input column names")
     column_group.add_argument(
         "--chr-col",
         default="chr",
-        help="输入文件中的 ID/chr 列名（默认: chr）。",
+        help="ID/chr column in the input file (default: chr).",
     )
     column_group.add_argument(
         "--position-col",
         default="position",
-        help="输入文件中的 position 列名（默认: position）。",
+        help="Position column in the input file (default: position).",
     )
     column_group.add_argument(
         "--output-col",
         default="sprinzl_position",
-        help="新增/替换的输出列名（默认: sprinzl_position）。",
+        help="Name of the added/replaced output column (default: sprinzl_position).",
     )
 
-    format_group = parser.add_argument_group("文件格式")
+    format_group = parser.add_argument_group("File format")
     format_group.add_argument(
         "--sep",
         default="tab",
-        help="输入/输出文件分隔符: tab, comma, semicolon, pipe 或单个字符（默认: tab）。",
+        help="Input/output delimiter: tab, comma, semicolon, pipe, or a single character (default: tab).",
     )
     format_group.add_argument(
         "--map-sep",
         default="tab",
-        help="映射表分隔符: tab, comma, semicolon, pipe 或单个字符（默认: tab）。",
+        help="Mapping-table delimiter: tab, comma, semicolon, pipe, or a single character (default: tab).",
     )
 
-    batch_group = parser.add_argument_group("文件夹批量模式")
+    batch_group = parser.add_argument_group("Directory batch mode")
     batch_group.add_argument(
         "--pattern",
         action="append",
         default=None,
-        help="文件夹模式下要处理的 glob pattern，可重复指定（默认: *.tsv）。",
+        help="Glob pattern(s) to process in directory mode; may be repeated (default: *.tsv).",
     )
     batch_group.add_argument(
         "--recursive",
         action="store_true",
-        help="文件夹模式下递归搜索输入文件。",
+        help="Search input files recursively in directory mode.",
     )
     batch_group.add_argument(
         "--workers",
         type=int,
         default=1,
-        help="文件夹模式并行进程数（默认: 1）。",
+        help="Process-pool size in directory mode (default: 1).",
     )
     batch_group.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="文件夹模式下单个文件失败时继续处理其它文件，最后汇总失败信息。",
+        help="In directory mode, continue after a per-file failure and report all failures at the end.",
     )
 
     args = parser.parse_args()
 
     if args.in_place and args.output:
-        parser.error("--in-place 不能和 --output 同时使用。")
+        parser.error("--in-place cannot be combined with --output.")
     if args.workers < 1:
-        parser.error("--workers 必须 >= 1。")
+        parser.error("--workers must be >= 1.")
 
     args.sep = parse_delimiter(args.sep, "--sep")
     args.map_sep = parse_delimiter(args.map_sep, "--map-sep")
@@ -406,7 +215,7 @@ def parse_delimiter(value: str, arg_name: str) -> str:
     }
     delimiter = aliases.get(value, value)
     if len(delimiter) != 1:
-        raise SystemExit(f"[ERROR] {arg_name} 只能是一个字符或 tab/comma/semicolon/pipe。")
+        raise SystemExit(f"[ERROR] {arg_name} must be a single character or tab/comma/semicolon/pipe.")
     return delimiter
 
 
@@ -440,7 +249,7 @@ def load_mapping(
     map_sprinzl_col: str,
 ) -> dict[tuple[str, str], str]:
     if not map_file.is_file():
-        raise FileNotFoundError(f"映射表不存在: {map_file}")
+        raise FileNotFoundError(f"Mapping table not found: {map_file}")
 
     mapping: dict[tuple[str, str], str] = {}
     row_count = 0
@@ -449,14 +258,14 @@ def load_mapping(
     with open_text(map_file, "rt") as handle:
         reader = csv.DictReader(handle, delimiter=map_sep)
         if reader.fieldnames is None:
-            raise ValueError(f"映射表为空: {map_file}")
+            raise ValueError(f"Mapping table is empty: {map_file}")
 
         required_cols = [map_id_col, map_position_col, map_sprinzl_col]
         missing_cols = [col for col in required_cols if col not in reader.fieldnames]
         if missing_cols:
             raise ValueError(
-                f"映射表缺少列: {', '.join(missing_cols)}; "
-                f"已有列: {', '.join(reader.fieldnames)}"
+                f"Mapping table is missing columns: {', '.join(missing_cols)}; "
+                f"found: {', '.join(reader.fieldnames)}"
             )
 
         for row in reader:
@@ -469,7 +278,7 @@ def load_mapping(
             if key in mapping:
                 if mapping[key] != value:
                     raise ValueError(
-                        "映射表中同一个 ID/position 对应多个 Sprinzl 值: "
+                        "Mapping table has conflicting Sprinzl values for the same ID/position: "
                         f"{key[0]} {key[1]} -> {mapping[key]} / {value}"
                     )
                 duplicate_count += 1
@@ -477,11 +286,11 @@ def load_mapping(
             mapping[key] = value
 
     if not mapping:
-        raise ValueError(f"映射表没有可用记录: {map_file}")
+        raise ValueError(f"Mapping table has no usable records: {map_file}")
 
     print(
-        f"[INFO] 读取 Sprinzl 映射: {len(mapping)} 个键 "
-        f"({row_count} 行, {duplicate_count} 个重复一致键)"
+        f"[INFO] Loaded Sprinzl mapping: {len(mapping)} keys "
+        f"({row_count} rows, {duplicate_count} duplicate consistent keys)"
     )
     return mapping
 
@@ -524,7 +333,7 @@ def resolve_jobs(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], boo
     input_path = Path(args.input).resolve()
 
     if not input_path.exists():
-        raise FileNotFoundError(f"输入路径不存在: {input_path}")
+        raise FileNotFoundError(f"Input path not found: {input_path}")
 
     if input_path.is_file():
         if args.in_place:
@@ -539,7 +348,7 @@ def resolve_jobs(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], boo
         return [(input_path, output_path)], False
 
     if not input_path.is_dir():
-        raise ValueError(f"输入路径既不是文件也不是文件夹: {input_path}")
+        raise ValueError(f"Input path is neither a file nor a directory: {input_path}")
 
     input_files = collect_input_files(
         input_path,
@@ -549,7 +358,7 @@ def resolve_jobs(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], boo
     )
     if not input_files:
         raise ValueError(
-            f"未在 {input_path} 中找到匹配文件: {', '.join(args.pattern)}"
+            f"No files matching {', '.join(args.pattern)} under {input_path}"
         )
 
     if args.in_place:
@@ -561,7 +370,7 @@ def resolve_jobs(args: argparse.Namespace) -> tuple[list[tuple[Path, Path]], boo
         else input_path / "sprinzl_annotated"
     )
     if output_dir.exists() and not output_dir.is_dir():
-        raise ValueError(f"文件夹输入时 --output 必须是输出文件夹: {output_dir}")
+        raise ValueError(f"For a directory input, --output must be a directory: {output_dir}")
 
     jobs: list[tuple[Path, Path]] = []
     for input_file in input_files:
@@ -589,7 +398,7 @@ def _init_worker(mapping: dict[tuple[str, str], str], config: dict[str, str]) ->
 
 def _worker_annotate(job: tuple[Path, Path]) -> dict[str, object]:
     if _WORKER_MAPPING is None or _WORKER_CONFIG is None:
-        raise RuntimeError("worker 未初始化")
+        raise RuntimeError("worker is not initialized")
     input_file, output_file = job
     return annotate_file(input_file, output_file, _WORKER_MAPPING, **_WORKER_CONFIG)
 
@@ -651,13 +460,13 @@ def write_annotated_file(
         try:
             header = next(reader)
         except StopIteration:
-            raise ValueError(f"输入文件为空: {input_file}")
+            raise ValueError(f"Input file is empty: {input_file}")
 
         if chr_col not in header:
-            raise ValueError(f"{input_file} 缺少列: {chr_col}; 已有列: {', '.join(header)}")
+            raise ValueError(f"{input_file} is missing column {chr_col}; found: {', '.join(header)}")
         if position_col not in header:
             raise ValueError(
-                f"{input_file} 缺少列: {position_col}; 已有列: {', '.join(header)}"
+                f"{input_file} is missing column {position_col}; found: {', '.join(header)}"
             )
 
         chr_idx = header.index(chr_col)
@@ -737,7 +546,7 @@ def main() -> int:
         jobs, is_batch = resolve_jobs(args)
         config = build_config(args)
 
-        print(f"[INFO] 待处理文件数: {len(jobs)}")
+        print(f"[INFO] Files to process: {len(jobs)}")
 
         if not is_batch or args.workers == 1:
             for job in jobs:
@@ -770,7 +579,7 @@ def main() -> int:
                     print_result(result)
 
         if failed:
-            print("[ERROR] 以下文件处理失败:", file=sys.stderr)
+            print("[ERROR] The following files failed:", file=sys.stderr)
             for input_name, message in failed:
                 print(f"  - {input_name}: {message}", file=sys.stderr)
             return 1
