@@ -1,0 +1,5 @@
+sample	group	assay	pair
+WT1_ribo	WT	ribo	WT1
+WT1_input	WT	rna	WT1
+KO1_ribo	KO	ribo	KO1
+KO1_input	KO	rna	KO1

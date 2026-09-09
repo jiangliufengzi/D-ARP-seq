@@ -1,0 +1,18 @@
+# Local configuration and generated analysis outputs
+config.sh
+results/
+raw_fastq/
+reference/*.ebwt
+reference/*.ebwtl
+reference/*.fai
+*.log
+__pycache__/
+*.py[cod]
+
+# The parent repository ignores most file types; keep this environment file.
+!environment.yml
+!samples.example.csv
+!samples.hela.csv
+!config.hela.sh
+!SOURCE_FILES.sha256
+!postprocess/hg38_trna_raw_to_sprinzl.tsv

@@ -1,0 +1,5 @@
+sample_id,role,background_set,merge_group,replicate,summary_name,summary_group
+Input_rep1,background,input,,1,,
+Input_rep2,background,input,,2,,
+NaBH4_rep1,treatment,input,NaBH4,1,NaBH4,NaBH4
+NaBH4_rep2,treatment,input,NaBH4,2,NaBH4,NaBH4
